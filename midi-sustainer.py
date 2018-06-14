@@ -16,13 +16,20 @@ class Sustainer:
         self.output = output
         self.sustain = False
         self.sustainCC = sustainCC
+        self.sustainHeld = False
 
     def send(self, message):
-        if(message.type == 'control_change' and message.control == self.sustainCC):
-            if(message.value == 127):
-                self.sustainOn()
-            else:
-                self.sustainOff()
+        if message.type == 'control_change':
+            if message.control == self.sustainCC:
+                if message.value == 127:
+                    self.sustainOn()
+                else:
+                    self.sustainOff()
+            elif message.control == 3:
+                if message.value == 127: 
+                    self.holdSustain()
+                else:
+                    self.unholdSustain()
         elif message.type == 'note_on':
             self.noteOn(message)
         elif message.type == 'note_off':
@@ -51,12 +58,28 @@ class Sustainer:
         if not self.sustain:
             self.output.send(message)
 
+    def holdSustain(self):
+        self.sustainHeld = True
+
+        if not self.sustain:
+            self.sustainOn()
+
+    def unholdSustain(self):
+        self.sustainHeld = False
+        if self.sustain:
+            self.sustainOff()
+
     def sustainOn(self):
+        if not self.sustainHeld:
+            self.notesPlaying = self.notesHeld.copy()
+
         self.sustain = True;
-        self.notesPlaying = self.notesHeld.copy()
 
     def sustainOff(self):
-        self.sustain = False;
+        if self.sustainHeld:
+            return
+
+        self.sustain = False
 
         # send note off for unheld notes
         for note in self.notesPlaying:
