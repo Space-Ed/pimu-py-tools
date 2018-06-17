@@ -18,10 +18,10 @@ class Tape:
 
 class KeyState:
     def __init__(self, message):
-        self.note = message.note,
-        self.channel = message.channel,
-        self.held = False,
-        self.on = False,
+        self.note = message.note
+        self.channel = message.channel
+        self.held = False
+        self.on = False
         self.tape = Tape()
 
 class Sustainer:
@@ -30,7 +30,7 @@ class Sustainer:
         self.output = output
         self.sustain = False
         self.sustainCC = sustainCC
-        self.sustainHeld = False
+        self.lock = False
 
     def send(self, message):
         if message.type == 'control_change':
@@ -41,9 +41,9 @@ class Sustainer:
                     self.sustainOff()
             elif message.control == 3:
                 if message.value == 127:
-                    self.holdSustain()
+                    self.lockOn()
                 else:
-                    self.unholdSustain()
+                    self.lockOff()
         elif message.type == 'note_on':
             self.noteOn(message)
         elif message.type == 'note_off':
@@ -56,25 +56,24 @@ class Sustainer:
         state = self.keys.get(key)
 
         if (state is None):
-            state = KeyState
+            state = KeyState(message)
+            self.keys[key] = state
 
         return state
 
     def heldNotes(self, is_held=True):
         return filter(lambda ks: ks.held == is_held, self.keys.values())
-    def onNotes(self, is_on=False):
+    def onNotes(self, is_on=True):
         return filter(lambda ks: ks.on == is_on, self.keys.values())
 
     def noteOn(self, message):
         keystate = self.getKeyState(message)
         keystate.held = True
 
-        if self.sustain:
-            if keystate.on:
-                self.output.send(mido.Message('note_off', note=keystate.note, keystate.channel))
-            self.output.send(message)
-        else:
-            self.output.send(message)
+        if (self.sustain or self.lock) and keystate.on:
+            self.output.send(mido.Message('note_off', note=keystate.note, channel=keystate.channel))
+
+        self.output.send(message)
 
         keystate.on = True
 
@@ -82,34 +81,32 @@ class Sustainer:
         keystate = self.getKeyState(message)
         keystate.held = False
 
-        #note off only turns off when sustain is off
-        if not self.sustain:
+        #note off only turns off when sustain and lock are off
+        if not (self.sustain or self.lock):
             self.output.send(message)
             keystate.on = False
 
-    def holdSustain(self):
-        self.sustainHeld = True
+    def lockOn(self):
+        self.lock = True
+
+    def lockOff(self):
+        self.lock = False
 
         if not self.sustain:
-            self.sustainOn()
-
-    def unholdSustain(self):
-        self.sustainHeld = False
-        if self.sustain:
-            self.sustainOff()
+            self.turnOffUnheld()
 
     def sustainOn(self):
         self.sustain = True;
 
     def sustainOff(self):
-        if self.sustainHeld:
-            return
-
         self.sustain = False
 
-        # send note off for unheld notes
-        for ks in self.onNotes():
-            if not ks.held:
+        if not self.lock:
+            self.turnOffUnheld()
+
+    def turnOffUnheld(self):
+        for ks in self.keys.values():
+            if ks.on and not ks.held:
                 self.output.send(mido.Message('note_off', note=ks.note, channel=ks.channel))
                 ks.on = False
 
