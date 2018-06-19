@@ -5,11 +5,6 @@ import signal
 import time
 from math import floor
 
-def create_source(midi_dev_name):
-    return  mido.open_input(midi_dev_name)
-
-def create_sink(midi_dev_name):
-    return mido.open_output(midi_dev_name)
 
 def key_channel(message):
     return (message.channel, message.note)
@@ -17,7 +12,7 @@ def key_channel(message):
 class TapeEvent:
     def __init__(self, message, tape):
         self.atime = time.time()
-        self.rtime = (self.atime - tape.clip_start)/tape.period
+        self.ntime = (self.atime - tape.clip_start)/tape.period
         self.partner = None
         self.message = message
         self.tape = tape
@@ -47,9 +42,9 @@ class Tape:
         canvas = ["-"]*100
         for ev in self.events:
             if (ev.message.type == 'note_on'):
-                canvas[floor(ev.rtime*100)] = '/'
+                canvas[floor(ev.ntime*100)] = '/'
             else:
-                canvas[floor(ev.rtime*100)] = '\\'
+                canvas[floor(ev.ntime*100)] = '\\'
 
         canvas[floor(self.npos*100)] = '|'
 
@@ -77,10 +72,10 @@ class Tape:
 
         self.index = (self.insertionPoint(self.npos)-1)%len(self.events)
         next = self.events[self.index]
-        rtime = next.rtime
+        ntime = next.ntime
 
-        print("(oldp:%d, rtime:%d, newp:%d)", (oldp, rtime, self.npos))
-        while between(oldp, rtime, self.npos):
+        #print("(oldp:%d, ntime:%d, newp:%d)", (oldp, ntime, self.npos))
+        while between(oldp, ntime, self.npos):
             if self.keystate.held:
                 self.erase_event(next) # when active we are erasing
             else:
@@ -89,13 +84,14 @@ class Tape:
             if len(self.events) == 0: return# no events to trigger
             self.index = (self.index + 1)%len(self.events)
             next = self.events[self.index]
-            rtime = next.rtime
+            oldp = ntime
+            ntime = next.ntime
 
-    def insertionPoint(self, rtime):
+    def insertionPoint(self, ntime):
         thumb = 0
         next = self.events[thumb]
 
-        while next.rtime <= rtime: #find the index of the event after this one
+        while next.ntime <= ntime: #find the index of the event after this one
             thumb += 1
             if thumb == len(self.events):
                 break
@@ -110,7 +106,11 @@ class Tape:
 
     def cut(self):
         #if this time lies between on and off events it will destroy them
-        rtime = (time.time() - self.clip_start)/self.period
+        ntime = (time.time() - self.clip_start)/self.period
+        index = self.insertionPoint(ntime)%len(self.events)
+        next_ev = self.events[index]
+        if next_ev.message.type == 'note_on':
+            self.erase_event(next_ev)
 
 
     def add_note(self, on_event, off_event):
@@ -125,14 +125,7 @@ class Tape:
             self.events.append(event)
             self.index = 0
         else:
-            thumb = 0
-            next = self.events[thumb]
-
-            while next.rtime <= event.rtime: #find the index of the event after this one
-                thumb += 1
-                if thumb == len(self.events):
-                    break
-                next = self.events[thumb]
+            thumb = self.insertionPoint(event.ntime)
 
             #insering there inserts before
             self.events.insert(thumb, event)
@@ -141,10 +134,8 @@ class Tape:
             if thumb < self.index:
                 self.index = self.index + 1
 
-
-
     def events_between(self, event1, event2):
-        return filter(lambda ev: between(event1.rtime, ev.rtime, event2.rtime), self.events)
+        return filter(lambda ev: between(event1.ntime, ev.ntime, event2.ntime), self.events)
 
     def erase_event(self, event):
         try:
@@ -174,12 +165,12 @@ class KeyState:
         self.held = False
         self.on = False
         self.tape = Tape(self)
-        #self.set_quantized_period(parent.lowq, parent.highq)
+        self.set_quantized_period(parent.lowq, parent.highq, parent.unitp)
         self.parent = parent
         self.current = message
 
-    def set_quantized_period(self, qlow, qhigh):
-        p = 2**floor(((self.note - 60)*(qhigh-qlow))/60.0 + qlow)
+    def set_quantized_period(self, qlow, qhigh, unit):
+        p = unit*2**floor(((self.note - 60)/60.0)*(qhigh-qlow) + qlow)
         self.tape.set_period(p)
 
     def noteOn(self, message):
@@ -190,7 +181,7 @@ class KeyState:
             if self.on:
                 self.tape.cut() #remove the currently playing event of the tape
                 self.turnOff()
-        elif (parent.sustain or self.parent.lock) and keystate.on:
+        elif (parent.sustain or self.parent.lock) and self.on:
             self.turnOff()
 
         self.parent.output.send(message)
@@ -220,7 +211,7 @@ class KeyState:
 
     def update(self, dt):
         self.tape.update(dt)
-        print(self.tape)
+        # print(self.tape)
 
 class Sustainer:
     def __init__(self, output):
@@ -229,8 +220,10 @@ class Sustainer:
         self.sustain = False
         self.lock = False
         self.loop = False
+
         self.highq = 0
         self.lowq = 0
+        self.unitp = 1
 
     def getKeyState(self, message):
         key = key_channel(message)
@@ -280,16 +273,23 @@ class Sustainer:
         self.loop = False
         # remove all events from the tapes
         self.clearAllTapes()
+        self.turnOffUnheld()
 
     def set_lowQ(self, lowq):
         self.lowq = lowq
-        for ks in self.keys.values():
-            ks.set_quantized_period(self.lowq, self.highq)
+        self.reset_periods()
 
-    def set_lowQ(self, lowq):
-        self.lowq = lowq
+    def set_highQ(self, highq):
+        self.highq = highq
+        self.reset_periods()
+
+    def set_unit_period(self, period):
+        self.unitp = period
+        self.reset_periods()
+
+    def reset_periods(self):
         for ks in self.keys.values():
-            ks.set_quantized_period(self.lowq, self.highq)
+            ks.set_quantized_period(self.lowq, self.highq, self.unitp)
 
     def clearAllTapes(self):
         for ks in self.keys.values():
@@ -298,7 +298,7 @@ class Sustainer:
     def turnOffUnheld(self):
         for ks in self.keys.values():
             if ks.on and not ks.held:
-                ks.sendOff()
+                ks.turnOff()
 
     def update(self, dt):
         for keystate in self.keys.values():
@@ -307,14 +307,39 @@ class Sustainer:
     def panic(self):
         self.output.reset()
 
-def inputs(match):
-    return [i for i in map(lambda name: create_source(name), filter(lambda name:match in name, mido.get_input_names()))]
+def open_inputs(inpd):
+    return dict([[k, mido.open_input(name)] for k, name in  inpd.items()])
 
-def main_loop(inputs, output, config):
+class Clock:
+    def __init__(self):
+        self.clock_time = time.time()
+        self.period = 1
+        self.oldp = 1
+        self.changed = False
+
+    def tick(self):
+        nct = time.time()
+        dct = nct - self.clock_time
+        self.clock_time = nct
+        self.period = 24*dct
+
+        if (abs(self.oldp - self.period)>0.01):
+            self.changed = True
+            self.oldp = self.period
+
+
+def main_loop(config):
+    inputs = open_inputs(config['inputs'])
+    output = mido.open_output(config['output'])
+
     monolith = Sustainer(output)
+    clock = Clock()
 
-    def dispatch(message):
-        if message.type == 'control_change':
+    def dispatch(source, message):
+        if source == 'um' and message.type == 'clock':
+            clock.tick()
+            monolith.set_unit_period(clock.period)
+        elif message.type == 'control_change':
             if message.control == config['sustainCC']:
                 if message.value == 127:
                     monolith.sustainOn()
@@ -331,9 +356,9 @@ def main_loop(inputs, output, config):
                 else:
                     monolith.loopOff()
             elif message.control == config['lowQCC']:
-                monolith.set_lowQ(((message.value-64)/64.0)*4)
+                monolith.set_lowQ(((message.value-64)/64.0)*config['lowQlimit'])
             elif message.control == config['highQCC']:
-                monolith.set_highQ(((message.value-64)/64.0)*4)
+                monolith.set_highQ(((message.value-64)/64.0)*config['highQlimit'])
             else:
                 output.send(message)
         elif message.type == 'note_on':
@@ -347,9 +372,9 @@ def main_loop(inputs, output, config):
     dt = 0
 
     while True:
-        for input in inputs:
+        for (key, input) in inputs.items():
             for m in input.iter_pending():
-                dispatch(m)
+                dispatch(key, m)
 
         monolith.update(dt)
 
@@ -357,21 +382,9 @@ def main_loop(inputs, output, config):
         dt = atime2 - atime
         atime = atime2
 
-        time.sleep(0.16)
+        time.sleep(0.016)
 
 if __name__=='__main__':
-    try:
-        inputPortName = sys.argv[1]
-        outputPortName = sys.argv[2]
-    except IndexError:
-        print("must provide input and output device names as args")
-
-    try:
-        inputs = inputs(inputPortName)
-        sink = create_sink(outputPortName)
-    except OSError as err:
-        print(err)
-        sys.exit(1)
 
     def signal_handler(signal, frame):
         print("closing ports and exiting")
@@ -379,11 +392,18 @@ if __name__=='__main__':
 
     signal.signal(signal.SIGINT, signal_handler)
 
-
-    main_loop(inputs, sink, {
+    main_loop({
+        'output': "Deluge:Deluge MIDI 1 20:0",
+        'inputs':{
+            'um':"UM-1:UM-1 MIDI 1 28:0",
+            'keylab-main':"Arturia KeyLab Essential 49:Arturia KeyLab Essential 49 MID 16:0",
+            'keylab-meta':"Arturia KeyLab Essential 49:Arturia KeyLab Essential 49 MID 16:1"
+        },
         'sustainCC':64,
         'lockCC':3,
         'loopCC':2,
-        'lowQCC':73,
-        'highQCC':75,
+        'lowQCC':74,
+        'highQCC':71,
+        'lowQlimit':4,
+        'highQlimit':4
     })
